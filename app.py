@@ -18,6 +18,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
+from image_preview import render_png_bytes
+
 # ─── Labels (match training order) ──────────────────────────────────────────────
 CLASS_NAMES = ["Center", "Donut", "Edge-Loc", "Edge-Ring", "Loc", "Random", "Scratch", "Near-Full", "none"]
 N_CLASSES = len(CLASS_NAMES)
@@ -121,11 +123,12 @@ def resolve_weights_path() -> Optional[Path]:
 
     # 2) Common local paths (include your file with a space in the name)
     candidates = [
-        BASE_DIR / "weights" / "wafernet_best_final.pth",
+        BASE_DIR / "weights" / "wafernet_best_4th sep.pth",
     ]
     # 3) Notebooks subfolders
     candidates += [
-        BASE_DIR / "notebooks" / "weights" / "wafernet_best_final.pth",
+        BASE_DIR / "notebooks" / "weights" / "wafernet_best_4th sep.pth",
+        
     ]
     for c in candidates:
         if c.exists():
@@ -498,6 +501,13 @@ def index():
                     <div class="preview" id="mask-preview"><img alt="Mask preview"></div>
                   </div>
 
+                  <div class="form-row">
+                    <label>Preview wafer (.npy -> PNG)</label>
+                    <button type="button" class="btn secondary" id="preview-btn">Render preview</button>
+                    <div class="hint" id="preview-hint">Uses /preview/file to render without running inference.</div>
+                    <div class="preview" id="preview-output"><img id="preview-image" alt="Wafer preview render" style="image-rendering: pixelated;"></div>
+                  </div>
+
                   <div class="form-row kgroup">
                     <div>
                       <label>Resize to</label>
@@ -526,7 +536,7 @@ def index():
                   <div>
                     <label>Tips</label>
                     <ul style="margin:6px 0 0 16px; padding:0; color: var(--muted);">
-                      <li>PNG/JPG shows a thumbnail preview. NPY is accepted but not previewed.</li>
+                      <li>PNG/JPG shows a thumbnail preview. Use the button above to render NPY via /preview/file.</li>
                       <li>Mask is optional; when provided, it’s applied in preprocessing.</li>
                     </ul>
                   </div>
@@ -573,6 +583,77 @@ def index():
 
               setupDrop('wafer-drop', 'wafer_file', 'wafer-meta', 'wafer-preview');
               setupDrop('mask-drop', 'mask_file', 'mask-meta', 'mask-preview');
+
+              const previewBtn = document.getElementById('preview-btn');
+              if (previewBtn) {
+                const waferInput = document.getElementById('wafer_file');
+                const maskInput = document.getElementById('mask_file');
+                const previewHint = document.getElementById('preview-hint');
+                const previewOutput = document.getElementById('preview-output');
+                const previewImage = document.getElementById('preview-image');
+                const defaultLabel = previewBtn.textContent;
+                let previewUrl = null;
+
+                previewBtn.addEventListener('click', async () => {
+                  if (!waferInput.files || !waferInput.files.length) {
+                    previewHint.textContent = 'Select a wafer .npy file first.';
+                    previewHint.style.color = '#ff8080';
+                    previewOutput.style.display = 'none';
+                    return;
+                  }
+
+                  const waferFile = waferInput.files[0];
+                  const waferName = (waferFile.name || '').toLowerCase();
+                  if (!waferName.endsWith('.npy')) {
+                    previewHint.textContent = 'Preview expects a .npy wafer file.';
+                    previewHint.style.color = '#ff8080';
+                    previewOutput.style.display = 'none';
+                    return;
+                  }
+
+                  const formData = new FormData();
+                  formData.append('wafer_file', waferFile, waferFile.name);
+                  if (maskInput.files && maskInput.files.length) {
+                    const maskFile = maskInput.files[0];
+                    formData.append('mask_file', maskFile, maskFile.name);
+                  }
+
+                  previewBtn.disabled = true;
+                  previewBtn.textContent = 'Rendering...';
+                  previewHint.textContent = 'Rendering preview...';
+                  previewHint.style.color = 'var(--muted)';
+
+                  try {
+                    const res = await fetch('/preview/file', { method: 'POST', body: formData });
+                    if (!res.ok) {
+                      let detail = await res.text();
+                      try {
+                        const parsed = JSON.parse(detail);
+                        if (parsed && parsed.detail) detail = parsed.detail;
+                      } catch (_) {}
+                      previewHint.textContent = detail || 'Failed to render preview.';
+                      previewHint.style.color = '#ff8080';
+                      previewOutput.style.display = 'none';
+                      return;
+                    }
+
+                    const blob = await res.blob();
+                    if (previewUrl) URL.revokeObjectURL(previewUrl);
+                    previewUrl = URL.createObjectURL(blob);
+                    previewImage.src = previewUrl;
+                    previewOutput.style.display = 'block';
+                    previewHint.textContent = 'Rendered preview from /preview/file';
+                    previewHint.style.color = 'var(--muted-2)';
+                  } catch (err) {
+                    previewHint.textContent = 'Network error while rendering preview.';
+                    previewHint.style.color = '#ff8080';
+                    previewOutput.style.display = 'none';
+                  } finally {
+                    previewBtn.disabled = false;
+                    previewBtn.textContent = defaultLabel;
+                  }
+                });
+              }
             </script>
           </body>
         </html>
@@ -698,3 +779,69 @@ async def predict_file(
     topk_idx = np.argsort(probs_np)[::-1][:k]
     topk = [(CLASS_NAMES[i], float(probs_np[i])) for i in topk_idx]
     return PredictResponse(predicted_index=idx, predicted_label=label, probabilities=probs_np, topk=topk, logits=logits_np)
+
+
+@app.post("/preview/file")
+async def preview_file(
+    wafer_file: UploadFile = File(..., description="Wafer .npy in (H,W) or (2,H,W) float32/float64"),
+    mask_file: Optional[UploadFile] = File(None, description="Optional mask .npy in {0,1}"),
+):
+    from fastapi import HTTPException
+
+    wafer_bytes = await wafer_file.read()
+    if not wafer_bytes:
+        raise HTTPException(status_code=400, detail="wafer_file is empty.")
+
+    try:
+        wafer_arr = np.load(io.BytesIO(wafer_bytes), allow_pickle=False)
+    except Exception as e:  # pragma: no cover - numpy error messages are varied
+        raise HTTPException(status_code=400, detail=f"Failed to load wafer_file: {e}") from e
+
+    mask_arr: Optional[np.ndarray] = None
+    if mask_file is not None:
+        mask_bytes = await mask_file.read()
+        if mask_bytes:
+            try:
+                mask_arr = np.load(io.BytesIO(mask_bytes), allow_pickle=False)
+            except Exception as e:  # pragma: no cover - numpy error messages are varied
+                raise HTTPException(status_code=400, detail=f"Failed to load mask_file: {e}") from e
+
+    def _squeeze(arr: np.ndarray) -> np.ndarray:
+        if arr.ndim == 3 and arr.shape[0] == 1:
+            return arr[0]
+        return arr
+
+    wafer_arr = np.asarray(wafer_arr)
+    wafer_from_stack: Optional[np.ndarray] = None
+
+    if wafer_arr.ndim == 2:
+        wafer_np = wafer_arr.astype(np.float32)
+    elif wafer_arr.ndim == 3 and wafer_arr.shape[0] == 2:
+        wafer_np = wafer_arr[0].astype(np.float32)
+        wafer_from_stack = wafer_arr[1].astype(np.float32)
+    elif wafer_arr.ndim == 3 and wafer_arr.shape[0] == 1:
+        wafer_np = wafer_arr[0].astype(np.float32)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unexpected wafer array shape {wafer_arr.shape}. Expected (H,W) or (2,H,W).")
+
+    if mask_arr is not None:
+        mask_np = _squeeze(np.asarray(mask_arr)).astype(np.float32)
+    elif wafer_from_stack is not None:
+        mask_np = wafer_from_stack.astype(np.float32)
+    else:
+        mask_np = (wafer_np > 0.0).astype(np.float32)
+
+    if mask_np.ndim != 2:
+        raise HTTPException(status_code=400, detail=f"Mask must be 2D after processing, got shape {list(mask_np.shape)}")
+    if wafer_np.shape != mask_np.shape:
+        raise HTTPException(status_code=400, detail=f"Mask shape {list(mask_np.shape)} must match wafer shape {list(wafer_np.shape)}")
+
+    mask_bin = (mask_np > 0.5).astype(np.float32)
+    wafer_np = np.clip(np.nan_to_num(wafer_np, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+
+    png_bytes = render_png_bytes(wafer_np, mask_bin)
+    return Response(content=png_bytes, media_type="image/png")
+
+#uvicorn app:app --reload --host 127.0.0.1 --port 8000
+
+#uvicorn app:app --reload --host 0.0.0.0 --port 8000
