@@ -2,6 +2,7 @@
 
 import os
 import io
+import base64
 import logging
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -17,6 +18,11 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
+
+from gradcam import GradCAM
+from image_preprocess import load_input_any
+from model_utils import get_gradcam_target_wafernet
+from overlay import overlay_cam_on_wafer
 
 from image_preview import render_png_bytes
 
@@ -128,7 +134,7 @@ def resolve_weights_path() -> Optional[Path]:
     # 3) Notebooks subfolders
     candidates += [
         BASE_DIR / "notebooks" / "weights" / "wafernet_best_4th sep.pth",
-        
+
     ]
     for c in candidates:
         if c.exists():
@@ -350,115 +356,161 @@ def index():
             <title>WaferNet · Inference API</title>
             <style>
               :root{
-                --bg:#000000;         /* black */
-                --fg:#FFFFFF;         /* white */
-                --surface:#1E1E1E;    /* card 1 */
-                --surface-2:#212121;  /* card 2 */
-                --muted: rgba(255,255,255,.60);
-                --muted-2: rgba(255,255,255,.38);
-                --ring: rgba(255,255,255,.20);
+                --bg:#000;
+                --fg:#fff;
+                --surface:#1e1e1e;
+                --surface-2:#232323;
+                --muted:rgba(255,255,255,.62);
+                --muted-2:rgba(255,255,255,.40);
+                --ring:rgba(255,255,255,.20);
               }
               *{box-sizing:border-box}
               html,body{height:100%}
               body{
                 margin:0;
-                font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
-                background: var(--bg);
-                color: var(--fg);
-                -webkit-font-smoothing: antialiased;
+                font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;
+                background:var(--bg);
+                color:var(--fg);
+                -webkit-font-smoothing:antialiased;
                 line-height:1.5;
               }
-              .container{
-                max-width: 960px;
-                margin: 0 auto;
-                padding: 32px 20px 64px;
-              }
               header{
-                display:flex; align-items:center; justify-content:space-between; gap:16px; 
-                padding: 16px 20px; 
-                position: sticky; top: 0; backdrop-filter: blur(6px);
-                background: linear-gradient(to bottom, rgba(0,0,0,.9), rgba(0,0,0,.6));
-                border-bottom: 1px solid rgba(255,255,255,.08);
+                display:flex;
+                align-items:center;
+                justify-content:space-between;
+                gap:16px;
+                padding:16px 20px;
+                position:sticky;
+                top:0;
+                background:rgba(0,0,0,.78);
+                backdrop-filter:blur(6px);
+                border-bottom:1px solid rgba(255,255,255,.08);
                 z-index:10;
               }
-              .brand{ display:flex; align-items:center; gap:12px; text-decoration:none; color:var(--fg);}
-              .logo{
-                width:32px; height:32px; border-radius:8px; background:linear-gradient(145deg, var(--surface), var(--surface-2));
-                display:grid; place-items:center; box-shadow: 0 0 0 1px rgba(255,255,255,.06) inset, 0 10px 30px rgba(0,0,0,.5);
-              }
-              .logo svg{width:18px; height:18px; opacity:.9}
-              nav a{
-                color: var(--muted);
-                text-decoration:none; margin-left:16px; font-size:14px; 
-                padding:8px 12px; border-radius:10px; border:1px solid transparent;
-              }
-              nav a:hover{ color:var(--fg); border-color: var(--ring); background: var(--surface-2);}
-              h1{
-                font-size: clamp(28px, 4vw, 44px); margin: 24px 0 8px; letter-spacing:-0.02em;
-              }
-              .sub{ color: var(--muted); max-width: 56ch; }
-              .grid{ display:grid; grid-template-columns: 1fr; gap: 16px; margin-top: 28px;}
-              @media(min-width: 880px){ .grid{ grid-template-columns: 1.2fr .8fr; } }
-              .card{
-                background: linear-gradient(180deg, var(--surface), var(--surface-2));
-                border: 1px solid rgba(255,255,255,.08);
-                border-radius: 16px;
-                padding: 20px;
-                box-shadow: 0 10px 30px rgba(0,0,0,.35);
-              }
-              .card h2{ margin: 0 0 12px; font-size:18px }
-              .form-row{ display:grid; gap: 12px; margin: 12px 0 0; }
-              label{ font-size: 14px; color: var(--muted); }
-              input[type="number"]{
-                width:100%; padding:10px 12px; border-radius:10px; border:1px solid rgba(255,255,255,.12);
-                background: #000; color: var(--fg); outline: none;
-              }
-              input[type="number"]:focus{ border-color: var(--ring); box-shadow: 0 0 0 4px rgba(255,255,255,.06); }
-              .drop{
-                display:grid; place-items:center; text-align:center;
-                padding: 22px; border: 1.5px dashed rgba(255,255,255,.18); border-radius: 14px;
-                background: #000;
-                transition: border-color .15s ease, transform .12s ease;
-              }
-              .drop:hover{ border-color: var(--fg); }
-              .drop.dragover{ border-color: var(--fg); transform: scale(1.01);}
-              .file-meta{ font-size:12px; color: var(--muted-2); margin-top:6px }
-              .btn{
-                appearance:none; border:none; cursor:pointer;
-                padding: 12px 16px; border-radius: 12px; 
-                background: #fff; color: #000; font-weight:600; 
-                box-shadow: 0 10px 24px rgba(0,0,0,.35); 
-                transition: transform .06s ease, box-shadow .2s ease, opacity .2s ease;
-                width: 100%;
-              }
-              .btn:hover{ transform: translateY(-1px); box-shadow: 0 16px 30px rgba(0,0,0,.45);}
-              .btn:active{ transform: translateY(0);}
-              .btn.secondary{
-                background: transparent; color: var(--fg); border:1px solid rgba(255,255,255,.16);
-              }
-              .links{
-                display:flex; gap:8px; flex-wrap:wrap; margin-top: 8px;
-              }
-              .pill{
-                display:inline-flex; align-items:center; gap:8px; font-size:12px;
-                padding:8px 10px; border-radius:999px; background:#000; border:1px solid rgba(255,255,255,.10); color: var(--muted);
+              .brand{
+                display:flex;
+                align-items:center;
+                gap:12px;
+                color:var(--fg);
                 text-decoration:none;
               }
-              .pill:hover{ color: var(--fg); border-color: var(--ring); }
-              footer{ color: var(--muted-2); font-size:12px; margin-top:24px;}
-              .preview{
-                display:none; margin-top:10px; border-radius:12px; overflow:hidden; border:1px solid rgba(255,255,255,.1);
+              .logo{
+                width:32px;
+                height:32px;
+                border-radius:10px;
+                background:linear-gradient(140deg,var(--surface),var(--surface-2));
+                display:grid;
+                place-items:center;
+                box-shadow:0 0 0 1px rgba(255,255,255,.06) inset,0 10px 26px rgba(0,0,0,.45);
               }
-              .preview img{ display:block; width:100%; height:auto; }
-              .hint{ font-size:12px; color: var(--muted-2); margin-top:8px}
-              .kgroup{ display:grid; grid-template-columns: 1fr 1fr; gap:12px }
+              .logo svg{width:18px;height:18px;opacity:.9}
+              nav a{
+                color:var(--muted);
+                text-decoration:none;
+                margin-left:16px;
+                font-size:14px;
+                padding:8px 12px;
+                border-radius:10px;
+                border:1px solid transparent;
+                transition:all .12s ease;
+              }
+              nav a:hover{color:var(--fg);border-color:var(--ring);background:var(--surface-2);}
+              .container{
+                max-width:1040px;
+                margin:0 auto;
+                padding:36px 20px 64px;
+              }
+              h1{font-size:clamp(30px,4vw,46px);margin:24px 0 6px;letter-spacing:-0.02em;}
+              .sub{color:var(--muted);max-width:60ch;}
+              .grid{
+                display:grid;
+                gap:18px;
+                margin-top:28px;
+              }
+              @media(min-width:960px){.grid{grid-template-columns:1.08fr .92fr;}}
+              .card{
+                background:linear-gradient(175deg,var(--surface),var(--surface-2));
+                border:1px solid rgba(255,255,255,.08);
+                border-radius:18px;
+                padding:22px;
+                box-shadow:0 12px 32px rgba(0,0,0,.40);
+              }
+              .card h2{margin:0 0 12px;font-size:18px;letter-spacing:-0.01em;}
+              .drop{
+                display:grid;
+                place-items:center;
+                text-align:center;
+                padding:26px;
+                border:1.6px dashed rgba(255,255,255,.18);
+                border-radius:16px;
+                background:#050505;
+                transition:border-color .16s ease,transform .12s ease;
+              }
+              .drop.dragover{border-color:var(--fg);transform:scale(1.01);}
+              .drop button{
+                appearance:none;
+                border:none;
+                cursor:pointer;
+                padding:10px 14px;
+                border-radius:12px;
+                background:#fff;
+                color:#000;
+                font-weight:600;
+                margin:6px 4px 0;
+                box-shadow:0 10px 22px rgba(0,0,0,.35);
+                transition:transform .08s ease,box-shadow .18s ease;
+              }
+              .drop button:hover{transform:translateY(-1px);box-shadow:0 16px 30px rgba(0,0,0,.45);}
+              .drop button:active{transform:translateY(0);}
+              .file-meta{font-size:12px;color:var(--muted-2);margin-top:6px;}
+              .actions{display:grid;gap:10px;margin-top:18px;}
+              @media(min-width:500px){.actions{grid-template-columns:1fr 1fr;}}
+              .btn{
+                appearance:none;
+                border:none;
+                cursor:pointer;
+                padding:14px 16px;
+                border-radius:14px;
+                font-weight:600;
+                font-size:15px;
+                transition:transform .08s ease,box-shadow .18s ease,opacity .18s ease;
+              }
+              .btn.primary{
+                background:#fff;
+                color:#000;
+                box-shadow:0 12px 26px rgba(0,0,0,.36);
+              }
+              .btn.secondary{
+                background:transparent;
+                color:var(--fg);
+                border:1px solid rgba(255,255,255,.22);
+              }
+              .btn:disabled{opacity:.55;cursor:not-allowed;transform:none;box-shadow:none;}
+              .btn:not(:disabled):hover{transform:translateY(-1px);box-shadow:0 18px 32px rgba(0,0,0,.45);}
+              .hint{font-size:12px;color:var(--muted-2);margin-top:10px;min-height:16px;}
+              .preview{display:none;margin-top:16px;border-radius:14px;overflow:hidden;border:1px solid rgba(255,255,255,.12);}
+              .preview img{display:block;width:100%;height:auto;}
+              .prediction{
+                display:none;
+              }
+              .prediction ul{list-style:none;padding:0;margin:12px 0 0;display:grid;gap:6px;}
+              .prediction li{
+                display:flex;
+                justify-content:space-between;
+                font-size:14px;
+                padding:10px 12px;
+                border-radius:10px;
+                background:rgba(255,255,255,.04);
+                border:1px solid rgba(255,255,255,.08);
+              }
+              footer{color:var(--muted-2);font-size:12px;margin-top:28px;text-align:center;}
             </style>
           </head>
           <body>
             <header>
               <a class="brand" href="/">
                 <div class="logo" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 8h16v8H4z"/><path d="M8 12h8M12 8v8"/></svg>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 8h16v8H4z"/><path d="M8 12h8"/><path d="M12 8v8"/></svg>
                 </div>
                 <strong>WaferNet</strong>
               </a>
@@ -468,197 +520,256 @@ def index():
                 <a href="/classes">Classes</a>
               </nav>
             </header>
-
             <main class="container">
               <h1>Inference Console</h1>
-              <p class="sub">Upload a wafer map and an optional mask to get class predictions. Minimal surface, maximal signal.</p>
-
+              <p class="sub">Upload a wafer map and get two actions: generate a Grad-CAM explanation or retrieve the probability distribution.</p>
               <div class="grid">
-                <form class="card" method="post" action="/predict/file" enctype="multipart/form-data">
-                  <h2>Predict from files</h2>
-
-                  <div class="form-row">
-                    <label>Wafer file (.png/.jpg/.npy)</label>
-                    <div class="drop" id="wafer-drop">
-                      <input id="wafer_file" type="file" name="wafer_file" accept=".png,.jpg,.jpeg,.npy" required style="display:none">
-                      <div>
-                        <strong>Drop file here</strong> or click to browse
-                        <div class="file-meta" id="wafer-meta">No file selected</div>
-                      </div>
-                    </div>
-                    <div class="preview" id="wafer-preview"><img alt="Wafer preview"></div>
-                  </div>
-
-                  <div class="form-row">
-                    <label>Mask file (.png/.jpg/.npy, optional)</label>
-                    <div class="drop" id="mask-drop">
-                      <input id="mask_file" type="file" name="mask_file" accept=".png,.jpg,.jpeg,.npy" style="display:none">
-                      <div>
-                        <strong>Drop mask here</strong> or click to browse
-                        <div class="file-meta" id="mask-meta">No file selected</div>
-                      </div>
-                    </div>
-                    <div class="preview" id="mask-preview"><img alt="Mask preview"></div>
-                  </div>
-
-                  <div class="form-row">
-                    <label>Preview wafer (.npy -> PNG)</label>
-                    <button type="button" class="btn secondary" id="preview-btn">Render preview</button>
-                    <div class="hint" id="preview-hint">Uses /preview/file to render without running inference.</div>
-                    <div class="preview" id="preview-output"><img id="preview-image" alt="Wafer preview render" style="image-rendering: pixelated;"></div>
-                  </div>
-
-                  <div class="form-row kgroup">
+                <section class="card">
+                  <h2>Upload wafer</h2>
+                  <div class="drop" id="drop-zone">
+                    <p>Drag & drop wafer maps or use the buttons below.</p>
                     <div>
-                      <label>Resize to</label>
-                      <input type="number" name="resize_to" value="96" min="1" inputmode="numeric">
+                      <button type="button" id="wafer-browse">Select wafer</button>
+                      <button type="button" id="mask-browse">Select mask (optional)</button>
                     </div>
-                    <div>
-                      <label>Top-K</label>
-                      <input type="number" name="return_topk" value="3" min="1" max="9" inputmode="numeric">
-                    </div>
+                    <p class="file-meta" id="wafer-meta">No wafer file selected</p>
+                    <p class="file-meta" id="mask-meta">No mask file selected</p>
                   </div>
-
-                  <div class="form-row">
-                    <button class="btn" type="submit">Run Prediction</button>
-                    <div class="hint">You’ll be redirected to the JSON response. Use the back button to submit another sample.</div>
+                  <input type="file" id="wafer-input" accept=".png,.jpg,.jpeg,.npy" hidden />
+                  <input type="file" id="mask-input" accept=".png,.jpg,.jpeg,.npy" hidden />
+                  <div class="actions">
+                    <button type="button" class="btn primary" id="explain-btn">Generate GradCam</button>
+                    <button type="button" class="btn secondary" id="predict-btn">Predict</button>
                   </div>
-                </form>
-
-                <aside class="card" aria-label="Info">
-                  <h2>About this API</h2>
-                  <p class="sub">A compact FastAPI wrapper for a wafer-defect classifier. Built for reproducible demos and quick validation.</p>
-                  <div class="links">
-                    <a class="pill" href="/openapi.json" target="_blank" rel="noopener">OpenAPI</a>
-                    <a class="pill" href="/redoc" target="_blank" rel="noopener">ReDoc</a>
+                  <p class="hint" id="upload-hint">Accepted: PNG/JPG/NPY wafer plus optional mask.</p>
+                  <div class="preview" id="explain-preview">
+                    <img id="explain-image" alt="Grad-CAM overlay" />
                   </div>
-                  <hr style="border: none; border-top:1px solid rgba(255,255,255,.08); margin:16px 0">
-                  <div>
-                    <label>Tips</label>
-                    <ul style="margin:6px 0 0 16px; padding:0; color: var(--muted);">
-                      <li>PNG/JPG shows a thumbnail preview. Use the button above to render NPY via /preview/file.</li>
-                      <li>Mask is optional; when provided, it’s applied in preprocessing.</li>
-                    </ul>
-                  </div>
-                  <footer>© WaferNet · Minimal dark UI powered by #000, #1E1E1E, #212121, #FFFFFF.</footer>
-                </aside>
+                  <p class="hint" id="explain-hint"></p>
+                </section>
+                <section class="card prediction" id="predict-section">
+                  <h2>Prediction</h2>
+                  <p id="predict-label"></p>
+                  <ul id="predict-list"></ul>
+                  <p class="hint" id="predict-hint"></p>
+                </section>
               </div>
-            </main>
+              <footer>
+                © 2024 WaferNet · DenseNet121 + Grad-CAM
+              </footer>
+             </main>
+             <script>
+               document.addEventListener('DOMContentLoaded', () => {
+                 const CLASS_NAMES = ["Center","Donut","Edge-Loc","Edge-Ring","Loc","Random","Scratch","Near-Full","none"];
+                 const dropZone = document.getElementById('drop-zone');
+                 const waferInput = document.getElementById('wafer-input');
+                 const maskInput = document.getElementById('mask-input');
+                 const waferMeta = document.getElementById('wafer-meta');
+                 const maskMeta = document.getElementById('mask-meta');
+                 const waferBrowse = document.getElementById('wafer-browse');
+                 const maskBrowse = document.getElementById('mask-browse');
+                 const explainBtn = document.getElementById('explain-btn');
+                 const predictBtn = document.getElementById('predict-btn');
+                 const explainPreview = document.getElementById('explain-preview');
+                 const explainImage = document.getElementById('explain-image');
+                 const explainHint = document.getElementById('explain-hint');
+                 const predictSection = document.getElementById('predict-section');
+                 const predictLabel = document.getElementById('predict-label');
+                 const predictList = document.getElementById('predict-list');
+                 const predictHint = document.getElementById('predict-hint');
 
-            <script>
-              function setupDrop(zoneId, inputId, metaId, previewId){
-                const zone = document.getElementById(zoneId);
-                const input = document.getElementById(inputId);
-                const meta = document.getElementById(metaId);
-                const preview = document.getElementById(previewId);
-                const img = preview.querySelector('img');
+                 function updateMeta() {
+                   waferMeta.textContent = waferInput.files && waferInput.files.length ? `Wafer: ${waferInput.files[0].name}` : 'No wafer file selected';
+                   maskMeta.textContent = maskInput.files && maskInput.files.length ? `Mask: ${maskInput.files[0].name}` : 'No mask file selected';
+                 }
 
-                const openPicker = () => input.click();
+                 function resetExplain() {
+                   explainPreview.style.display = 'none';
+                   explainImage.removeAttribute('src');
+                   explainHint.textContent = '';
+                 }
 
-                const onFiles = (files) => {
-                  if(!files || !files.length) return;
-                  input.files = files;
-                  const f = files[0];
-                  meta.textContent = f.name + " · " + Math.round(f.size/1024) + " KB";
-                  const isImage = /image\\/(png|jpeg|jpg)/.test(f.type);
-                  if(isImage){
-                    const url = URL.createObjectURL(f);
-                    img.src = url;
-                    preview.style.display = 'block';
-                  }else{
-                    preview.style.display = 'none';
-                  }
-                };
+                 function resetPredict() {
+                   predictSection.style.display = 'none';
+                   predictLabel.textContent = '';
+                   predictList.innerHTML = '';
+                   predictHint.textContent = '';
+                 }
 
-                zone.addEventListener('click', openPicker);
-                zone.addEventListener('dragover', (e)=>{ e.preventDefault(); zone.classList.add('dragover'); });
-                zone.addEventListener('dragleave', ()=> zone.classList.remove('dragover'));
-                zone.addEventListener('drop', (e)=>{
-                  e.preventDefault();
-                  zone.classList.remove('dragover');
-                  onFiles(e.dataTransfer.files);
-                });
-                input.addEventListener('change', ()=> onFiles(input.files));
-              }
+                 function toFileList(files) {
+                   if (!files || !files.length) return null;
+                   if (typeof DataTransfer === 'undefined') return null;
+                   const dt = new DataTransfer();
+                   files.forEach(file => dt.items.add(file));
+                   return dt.files;
+                 }
 
-              setupDrop('wafer-drop', 'wafer_file', 'wafer-meta', 'wafer-preview');
-              setupDrop('mask-drop', 'mask_file', 'mask-meta', 'mask-preview');
+                 function assignFiles(list) {
+                   if (!list || !list.length) return;
+                   const files = Array.from(list);
+                   const waferFile = files[0];
+                   const maskFile = files.length > 1 ? files[1] : null;
+                   const waferList = toFileList([waferFile]);
+                   if (waferList) {
+                     waferInput.files = waferList;
+                   }
+                   if (maskFile) {
+                     const maskList = toFileList([maskFile]);
+                     if (maskList) maskInput.files = maskList;
+                   }
+                   updateMeta();
+                   resetExplain();
+                   resetPredict();
+                 }
 
-              const previewBtn = document.getElementById('preview-btn');
-              if (previewBtn) {
-                const waferInput = document.getElementById('wafer_file');
-                const maskInput = document.getElementById('mask_file');
-                const previewHint = document.getElementById('preview-hint');
-                const previewOutput = document.getElementById('preview-output');
-                const previewImage = document.getElementById('preview-image');
-                const defaultLabel = previewBtn.textContent;
-                let previewUrl = null;
+                 updateMeta();
 
-                previewBtn.addEventListener('click', async () => {
-                  if (!waferInput.files || !waferInput.files.length) {
-                    previewHint.textContent = 'Select a wafer .npy file first.';
-                    previewHint.style.color = '#ff8080';
-                    previewOutput.style.display = 'none';
-                    return;
-                  }
+                 ['dragenter','dragover'].forEach(eventName => {
+                   dropZone.addEventListener(eventName, evt => {
+                     evt.preventDefault();
+                     evt.stopPropagation();
+                     dropZone.classList.add('dragover');
+                   });
+                 });
+                 ['dragleave','drop'].forEach(eventName => {
+                   dropZone.addEventListener(eventName, evt => {
+                     evt.preventDefault();
+                     evt.stopPropagation();
+                     dropZone.classList.remove('dragover');
+                   });
+                 });
+                 dropZone.addEventListener('drop', evt => {
+                   if (evt.dataTransfer && evt.dataTransfer.files) {
+                     assignFiles(evt.dataTransfer.files);
+                   }
+                 });
 
-                  const waferFile = waferInput.files[0];
-                  const waferName = (waferFile.name || '').toLowerCase();
-                  if (!waferName.endsWith('.npy')) {
-                    previewHint.textContent = 'Preview expects a .npy wafer file.';
-                    previewHint.style.color = '#ff8080';
-                    previewOutput.style.display = 'none';
-                    return;
-                  }
+                 waferBrowse.addEventListener('click', () => waferInput.click());
+                 maskBrowse.addEventListener('click', () => maskInput.click());
+                 waferInput.addEventListener('change', () => {
+                   updateMeta();
+                   resetExplain();
+                   resetPredict();
+                 });
+                 maskInput.addEventListener('change', () => {
+                   updateMeta();
+                   resetExplain();
+                   resetPredict();
+                 });
 
-                  const formData = new FormData();
-                  formData.append('wafer_file', waferFile, waferFile.name);
-                  if (maskInput.files && maskInput.files.length) {
-                    const maskFile = maskInput.files[0];
-                    formData.append('mask_file', maskFile, maskFile.name);
-                  }
+                 function ensureWafer() {
+                   if (!waferInput.files || !waferInput.files.length) {
+                     explainHint.textContent = 'Select a wafer file before running inference.';
+                     explainHint.style.color = '#ff8080';
+                     return false;
+                   }
+                   explainHint.style.color = 'var(--muted)';
+                   return true;
+                 }
 
-                  previewBtn.disabled = true;
-                  previewBtn.textContent = 'Rendering...';
-                  previewHint.textContent = 'Rendering preview...';
-                  previewHint.style.color = 'var(--muted)';
+                 async function runExplain() {
+                   if (!ensureWafer()) return;
+                   const formData = new FormData();
+                   const waferFile = waferInput.files[0];
+                   formData.append('wafer', waferFile, waferFile.name);
+                   if (maskInput.files && maskInput.files.length) {
+                     const maskFile = maskInput.files[0];
+                     formData.append('mask', maskFile, maskFile.name);
+                   }
+                   formData.append('resize', '96');
 
-                  try {
-                    const res = await fetch('/preview/file', { method: 'POST', body: formData });
-                    if (!res.ok) {
-                      let detail = await res.text();
-                      try {
-                        const parsed = JSON.parse(detail);
-                        if (parsed && parsed.detail) detail = parsed.detail;
-                      } catch (_) {}
-                      previewHint.textContent = detail || 'Failed to render preview.';
-                      previewHint.style.color = '#ff8080';
-                      previewOutput.style.display = 'none';
-                      return;
-                    }
+                   explainBtn.disabled = true;
+                   explainBtn.textContent = 'Generating...';
+                   explainHint.textContent = 'Calculating Grad-CAM...';
+                   explainHint.style.color = 'var(--muted)';
 
-                    const blob = await res.blob();
-                    if (previewUrl) URL.revokeObjectURL(previewUrl);
-                    previewUrl = URL.createObjectURL(blob);
-                    previewImage.src = previewUrl;
-                    previewOutput.style.display = 'block';
-                    previewHint.textContent = 'Rendered preview from /preview/file';
-                    previewHint.style.color = 'var(--muted-2)';
-                  } catch (err) {
-                    previewHint.textContent = 'Network error while rendering preview.';
-                    previewHint.style.color = '#ff8080';
-                    previewOutput.style.display = 'none';
-                  } finally {
-                    previewBtn.disabled = false;
-                    previewBtn.textContent = defaultLabel;
-                  }
-                });
-              }
-            </script>
-          </body>
-        </html>
-        """
-    )
+                   try {
+                     const res = await fetch('/predict/explain', { method: 'POST', body: formData });
+                     const payload = await res.json().catch(() => null);
+                     if (!res.ok || !payload || !payload.overlay_png_base64) {
+                       const detail = payload && payload.detail ? payload.detail : 'Failed to generate explanation.';
+                       explainHint.textContent = detail;
+                       explainHint.style.color = '#ff8080';
+                       resetExplain();
+                       return;
+                     }
+                     explainImage.src = payload.overlay_png_base64;
+                     explainPreview.style.display = 'block';
+                     explainHint.textContent = 'Grad-CAM overlay generated.';
+                     explainHint.style.color = 'var(--muted-2)';
+                   } catch (err) {
+                     explainHint.textContent = 'Network error while generating Grad-CAM.';
+                     explainHint.style.color = '#ff8080';
+                     resetExplain();
+                   } finally {
+                     explainBtn.disabled = false;
+                     explainBtn.textContent = 'Generate Prediction';
+                   }
+                 }
+
+                 async function runPredict() {
+                   if (!ensureWafer()) return;
+                   const formData = new FormData();
+                   const waferFile = waferInput.files[0];
+                   formData.append('wafer_file', waferFile, waferFile.name);
+                   if (maskInput.files && maskInput.files.length) {
+                     const maskFile = maskInput.files[0];
+                     formData.append('mask_file', maskFile, maskFile.name);
+                   }
+                   formData.append('resize_to', '96');
+                   formData.append('return_topk', '9');
+
+                   predictBtn.disabled = true;
+                   predictBtn.textContent = 'Predicting...';
+                   predictHint.textContent = 'Running inference...';
+                   predictHint.style.color = 'var(--muted)';
+
+                   try {
+                     const res = await fetch('/predict/file', { method: 'POST', body: formData });
+                     const payload = await res.json().catch(() => null);
+                     if (!res.ok || !payload) {
+                       const detail = payload && payload.detail ? payload.detail : 'Prediction failed.';
+                       predictHint.textContent = detail;
+                       predictHint.style.color = '#ff8080';
+                       predictSection.style.display = 'block';
+                       predictLabel.textContent = '';
+                       predictList.innerHTML = '';
+                       return;
+                     }
+                     const probs = Array.isArray(payload.probabilities) ? payload.probabilities : [];
+                     predictLabel.textContent = `Predicted class: ${payload.predicted_label}`;
+                     predictList.innerHTML = '';
+                     probs.forEach((prob, idx) => {
+                       const label = CLASS_NAMES[idx] || `Class ${idx}`;
+                       const pct = (prob * 100).toFixed(1);
+                       const li = document.createElement('li');
+                       li.innerHTML = `<span>${label}</span><span>${pct}%</span>`;
+                       predictList.appendChild(li);
+                     });
+                     predictSection.style.display = 'block';
+                     predictHint.textContent = 'Probabilities generated from /predict/file.';
+                     predictHint.style.color = 'var(--muted-2)';
+                   } catch (err) {
+                     predictHint.textContent = 'Network error while predicting.';
+                     predictHint.style.color = '#ff8080';
+                     predictSection.style.display = 'block';
+                     predictLabel.textContent = '';
+                     predictList.innerHTML = '';
+                   } finally {
+                     predictBtn.disabled = false;
+                     predictBtn.textContent = 'Predict';
+                   }
+                 }
+
+                 explainBtn.addEventListener('click', runExplain);
+                 predictBtn.addEventListener('click', runPredict);
+               });
+             </script>
+           </body>
+         </html>
+         """
+     )
+
 
 @app.get("/favicon.ico")
 def favicon():
@@ -841,6 +952,84 @@ async def preview_file(
 
     png_bytes = render_png_bytes(wafer_np, mask_bin)
     return Response(content=png_bytes, media_type="image/png")
+
+
+@app.post("/predict/explain")
+async def predict_explain(
+    wafer: UploadFile = File(..., description="Wafer (.png/.jpg/.npy)"),
+    mask: Optional[UploadFile] = File(None, description="Optional mask (.png/.jpg/.npy)"),
+    resize: int = Form(96),
+):
+    from fastapi import HTTPException
+
+    mdl = load_model()
+    if mdl is None:
+        raise HTTPException(status_code=503, detail=f"Model not loaded: {_model_load_error}")
+
+    try:
+        resize_val = int(resize)
+        if resize_val <= 0:
+            raise ValueError("resize must be positive")
+
+        wafer_bytes = await wafer.read()
+        mask_bytes = await mask.read() if mask is not None else None
+
+        wafer_stack = load_input_any(
+            wafer_bytes=wafer_bytes,
+            wafer_filename=wafer.filename,
+            mask_bytes=mask_bytes,
+            mask_filename=(mask.filename if mask else None),
+            resize=resize_val,
+        )
+
+        wafer_np = wafer_stack[0]
+        mask_np = (wafer_stack[1] > 0).astype(np.float32)
+
+        tensor_input = _prep_from_arrays(wafer_np, mask_np, size=resize_val)
+        tensor_input = tensor_input.clone().requires_grad_(True)
+
+        target = get_gradcam_target_wafernet(mdl, "db3")
+        if target is None:
+            raise RuntimeError("Could not locate Grad-CAM target layer for WaferNet")
+
+        cam_engine = GradCAM(mdl, target)
+        try:
+            cam, logits, act_shape = cam_engine(
+                tensor_input,
+                class_idx=None,
+                out_size=resize_val,
+            )
+        finally:
+            cam_engine.remove()
+
+        probs = torch.softmax(logits, dim=1)[0]
+        explained_idx = int(probs.argmax().item())
+
+        cam_np = cam[0, 0].detach().cpu().numpy().astype(np.float32)
+        processed = tensor_input[0].detach().cpu().numpy()
+        wafer_proc = np.clip(processed[0], 0.0, 1.0)
+        mask_proc = (processed[1] > 0).astype(np.float32)
+
+        cam_np = np.nan_to_num(cam_np, nan=0.0, neginf=0.0, posinf=0.0)
+        cam_np *= mask_proc
+        inside = cam_np[mask_proc > 0]
+        if inside.size > 0:
+            cmn, cmx = float(inside.min()), float(inside.max())
+            if cmx > cmn:
+                cam_np = (cam_np - cmn) / (cmx - cmn)
+        cam_np[mask_proc <= 0] = 0.0
+
+        png_bytes = overlay_cam_on_wafer(wafer_proc, mask_proc, cam_np, alpha=0.55)
+        b64 = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+
+        return {
+            "predicted_index": explained_idx,
+            "predicted_label": CLASS_NAMES[explained_idx],
+            "overlay_png_base64": b64,
+            "activation_shape": list(act_shape),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Explainability failed: {type(e).__name__}: {e}")
 
 #uvicorn app:app --reload --host 127.0.0.1 --port 8000
 
