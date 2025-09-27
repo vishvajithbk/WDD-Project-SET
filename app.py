@@ -465,6 +465,17 @@ def index():
               .file-meta{font-size:12px;color:var(--muted-2);margin-top:6px;}
               .actions{display:grid;gap:10px;margin-top:18px;}
               @media(min-width:500px){.actions{grid-template-columns:1fr 1fr;}}
+              .params{display:grid;gap:12px;margin-top:16px;}
+              @media(min-width:500px){.params{grid-template-columns:1fr 1fr;}}
+              .params label{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted);}
+              .params input{
+                padding:10px 12px;
+                border-radius:10px;
+                border:1px solid rgba(255,255,255,.18);
+                background:#050505;
+                color:var(--fg);
+              }
+              .params input:focus{outline:none;border-color:var(--ring);box-shadow:0 0 0 3px rgba(255,255,255,.08);}
               .btn{
                 appearance:none;
                 border:none;
@@ -532,15 +543,25 @@ def index():
                       <button type="button" id="wafer-browse">Select wafer</button>
                       <button type="button" id="mask-browse">Select mask (optional)</button>
                     </div>
-                    <p class="file-meta" id="wafer-meta">No wafer file selected</p>
-                    <p class="file-meta" id="mask-meta">No mask file selected</p>
-                  </div>
-                  <input type="file" id="wafer-input" accept=".png,.jpg,.jpeg,.npy" hidden />
+                  <p class="file-meta" id="wafer-meta">No wafer file selected</p>
+                  <p class="file-meta" id="mask-meta">No mask file selected</p>
+                </div>
+                <div class="params">
+                  <label>
+                    Resize (px)
+                    <input type="number" id="resize-input" min="16" max="256" value="96" step="1" />
+                  </label>
+                  <label>
+                    Top-k classes
+                    <input type="number" id="topk-input" min="1" max="9" value="3" step="1" />
+                  </label>
+                </div>
+                <input type="file" id="wafer-input" accept=".png,.jpg,.jpeg,.npy" hidden />
                   <input type="file" id="mask-input" accept=".png,.jpg,.jpeg,.npy" hidden />
-                  <div class="actions">
-                    <button type="button" class="btn primary" id="explain-btn">Generate GradCam</button>
-                    <button type="button" class="btn secondary" id="predict-btn">Predict</button>
-                  </div>
+                <div class="actions">
+                  <button type="button" class="btn primary" id="explain-btn">Generate Prediction</button>
+                  <button type="button" class="btn secondary" id="predict-btn">Predict</button>
+                </div>
                   <p class="hint" id="upload-hint">Accepted: PNG/JPG/NPY wafer plus optional mask.</p>
                   <div class="preview" id="explain-preview">
                     <img id="explain-image" alt="Grad-CAM overlay" />
@@ -570,6 +591,8 @@ def index():
                  const maskBrowse = document.getElementById('mask-browse');
                  const explainBtn = document.getElementById('explain-btn');
                  const predictBtn = document.getElementById('predict-btn');
+                 const resizeInput = document.getElementById('resize-input');
+                 const topkInput = document.getElementById('topk-input');
                  const explainPreview = document.getElementById('explain-preview');
                  const explainImage = document.getElementById('explain-image');
                  const explainHint = document.getElementById('explain-hint');
@@ -594,6 +617,20 @@ def index():
                    predictLabel.textContent = '';
                    predictList.innerHTML = '';
                    predictHint.textContent = '';
+                 }
+
+                 function clampResize() {
+                   const value = parseInt(resizeInput.value, 10);
+                   const clamped = Number.isFinite(value) ? Math.min(256, Math.max(16, value)) : 96;
+                   resizeInput.value = String(clamped);
+                   return clamped;
+                 }
+
+                 function clampTopk() {
+                   const value = parseInt(topkInput.value, 10);
+                   const clamped = Number.isFinite(value) ? Math.min(CLASS_NAMES.length, Math.max(1, value)) : 3;
+                   topkInput.value = String(clamped);
+                   return clamped;
                  }
 
                  function toFileList(files) {
@@ -656,6 +693,11 @@ def index():
                    resetExplain();
                    resetPredict();
                  });
+                 resizeInput.addEventListener('change', clampResize);
+                 topkInput.addEventListener('change', clampTopk);
+
+                 clampResize();
+                 clampTopk();
 
                  function ensureWafer() {
                    if (!waferInput.files || !waferInput.files.length) {
@@ -667,23 +709,24 @@ def index():
                    return true;
                  }
 
-                 async function runExplain() {
-                   if (!ensureWafer()) return;
-                   const formData = new FormData();
-                   const waferFile = waferInput.files[0];
-                   formData.append('wafer', waferFile, waferFile.name);
-                   if (maskInput.files && maskInput.files.length) {
-                     const maskFile = maskInput.files[0];
-                     formData.append('mask', maskFile, maskFile.name);
-                   }
-                   formData.append('resize', '96');
+                async function runExplain() {
+                  if (!ensureWafer()) return;
+                  const resizeVal = clampResize();
+                  const formData = new FormData();
+                  const waferFile = waferInput.files[0];
+                  formData.append('wafer', waferFile, waferFile.name);
+                  if (maskInput.files && maskInput.files.length) {
+                    const maskFile = maskInput.files[0];
+                    formData.append('mask', maskFile, maskFile.name);
+                  }
+                  formData.append('resize', String(resizeVal));
 
-                   explainBtn.disabled = true;
-                   explainBtn.textContent = 'Generating...';
-                   explainHint.textContent = 'Calculating Grad-CAM...';
-                   explainHint.style.color = 'var(--muted)';
+                  explainBtn.disabled = true;
+                  explainBtn.textContent = 'Generating...';
+                  explainHint.textContent = `Calculating Grad-CAM (resize=${resizeVal}).`;
+                  explainHint.style.color = 'var(--muted)';
 
-                   try {
+                  try {
                      const res = await fetch('/predict/explain', { method: 'POST', body: formData });
                      const payload = await res.json().catch(() => null);
                      if (!res.ok || !payload || !payload.overlay_png_base64) {
@@ -707,22 +750,24 @@ def index():
                    }
                  }
 
-                 async function runPredict() {
-                   if (!ensureWafer()) return;
-                   const formData = new FormData();
-                   const waferFile = waferInput.files[0];
-                   formData.append('wafer_file', waferFile, waferFile.name);
-                   if (maskInput.files && maskInput.files.length) {
-                     const maskFile = maskInput.files[0];
-                     formData.append('mask_file', maskFile, maskFile.name);
-                   }
-                   formData.append('resize_to', '96');
-                   formData.append('return_topk', '9');
+                async function runPredict() {
+                  if (!ensureWafer()) return;
+                  const resizeVal = clampResize();
+                  const topkVal = clampTopk();
+                  const formData = new FormData();
+                  const waferFile = waferInput.files[0];
+                  formData.append('wafer_file', waferFile, waferFile.name);
+                  if (maskInput.files && maskInput.files.length) {
+                    const maskFile = maskInput.files[0];
+                    formData.append('mask_file', maskFile, maskFile.name);
+                  }
+                  formData.append('resize_to', String(resizeVal));
+                  formData.append('return_topk', String(topkVal));
 
-                   predictBtn.disabled = true;
-                   predictBtn.textContent = 'Predicting...';
-                   predictHint.textContent = 'Running inference...';
-                   predictHint.style.color = 'var(--muted)';
+                  predictBtn.disabled = true;
+                  predictBtn.textContent = 'Predicting...';
+                  predictHint.textContent = `Running inference (k=${topkVal}, resize=${resizeVal}).`;
+                  predictHint.style.color = 'var(--muted)';
 
                    try {
                      const res = await fetch('/predict/file', { method: 'POST', body: formData });
@@ -736,19 +781,37 @@ def index():
                        predictList.innerHTML = '';
                        return;
                      }
-                     const probs = Array.isArray(payload.probabilities) ? payload.probabilities : [];
-                     predictLabel.textContent = `Predicted class: ${payload.predicted_label}`;
-                     predictList.innerHTML = '';
-                     probs.forEach((prob, idx) => {
-                       const label = CLASS_NAMES[idx] || `Class ${idx}`;
-                       const pct = (prob * 100).toFixed(1);
-                       const li = document.createElement('li');
-                       li.innerHTML = `<span>${label}</span><span>${pct}%</span>`;
-                       predictList.appendChild(li);
-                     });
-                     predictSection.style.display = 'block';
-                     predictHint.textContent = 'Probabilities generated from /predict/file.';
-                     predictHint.style.color = 'var(--muted-2)';
+                    const probs = Array.isArray(payload.probabilities) ? payload.probabilities : [];
+                    const topkRaw = Array.isArray(payload.topk) ? payload.topk : [];
+                    const topkPairs = topkRaw.map(entry => {
+                      if (Array.isArray(entry) && entry.length >= 2) {
+                        return { label: String(entry[0]), prob: Number(entry[1]) };
+                      }
+                      if (entry && typeof entry === 'object' && 'label' in entry && 'prob' in entry) {
+                        return { label: String(entry.label), prob: Number(entry.prob) };
+                      }
+                      return null;
+                    }).filter(item => item && Number.isFinite(item.prob));
+                    const fallbackPairs = probs.map((prob, idx) => ({
+                      label: CLASS_NAMES[idx] || `Class ${idx}`,
+                      prob: Number(prob),
+                    })).filter(item => Number.isFinite(item.prob));
+                    const listSource = topkPairs.length ? topkPairs.slice(0) : fallbackPairs.slice().sort((a, b) => b.prob - a.prob);
+                    const rows = listSource.slice(0, topkVal);
+                    predictList.innerHTML = '';
+                    rows.forEach(({ label, prob }) => {
+                      const probVal = Number(prob);
+                      const probText = Number.isFinite(probVal) ? probVal.toFixed(6) : '0.000000';
+                      const pctText = Number.isFinite(probVal) ? (probVal * 100).toFixed(2) : '0.00';
+                      const li = document.createElement('li');
+                      li.innerHTML = `<span>${label}</span><span>${probText} (${pctText}%)</span>`;
+                      predictList.appendChild(li);
+                    });
+                    const topRow = rows[0];
+                    predictLabel.textContent = topRow ? `Predicted class: ${topRow.label} (p=${topRow.prob.toFixed(4)})` : `Predicted class: ${payload.predicted_label}`;
+                    predictSection.style.display = 'block';
+                    predictHint.textContent = `Top ${rows.length} classes (k=${topkVal}) at resize ${resizeVal} from /predict/file.`;
+                    predictHint.style.color = 'var(--muted-2)';
                    } catch (err) {
                      predictHint.textContent = 'Network error while predicting.';
                      predictHint.style.color = '#ff8080';
